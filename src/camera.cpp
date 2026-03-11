@@ -1,20 +1,19 @@
 #include "camera.hpp"
 #include "uploader.hpp"
-#include "ltr559.hpp"
 #include "light.hpp"
+#include "capture_cleanup.hpp"
+#include "capture_env.hpp"
+#include "capture_lux.hpp"
+#include "capture_round_log.hpp"
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <vector>
-#include <algorithm>
-#include <cstdint>
 #include <ctime>
 
 static int g_retain_days = 7;
@@ -44,34 +43,19 @@ static std::string now_ts() {
     return oss.str();
 }
 
-static bool read_lux_once(double& lux_out) {
-    uint16_t ch0 = 0, ch1 = 0, ps = 0;
-    uint8_t st = 0;
-    if (!ltr559_read_raw(ch0, ch1, ps, st)) return false;
-    lux_out = ltr559_estimate_lux(ch0, ch1);
-    return true;
+static std::string now_utc_iso() {
+    auto t = std::time(nullptr);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+    return oss.str();
 }
 
-static bool read_lux_avg(int n, int gap_ms, double& avg_lux, int& ok_count) {
-    std::vector<double> vals;
-    vals.reserve(n);
-
-    for (int i = 0; i < n; ++i) {
-        double lux = 0.0;
-        if (read_lux_once(lux)) {
-            vals.push_back(lux);
-        }
-        if (i != n - 1) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(gap_ms));
-        }
-    }
-
-    ok_count = static_cast<int>(vals.size());
-    if (vals.empty()) return false;
-
-    double sum = std::accumulate(vals.begin(), vals.end(), 0.0);
-    avg_lux = sum / vals.size();
-    return true;
+static std::string make_round_id() {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return "round_" + std::to_string(now_ms);
 }
 
 bool capture_init(const std::string& out_dir,
@@ -109,120 +93,6 @@ bool capture_init(const std::string& out_dir,
     return true;
 }
 
-static bool is_image_file(const std::filesystem::path& p) {
-    auto ext = p.extension().string();
-    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return (ext == ".jpg" || ext == ".jpeg" || ext == ".png");
-}
-
-struct FileInfo {
-    std::filesystem::path path;
-    std::filesystem::file_time_type mtime;
-    std::uintmax_t size = 0;
-};
-
-static void cleanup_captures() {
-    namespace fs = std::filesystem;
-
-    std::vector<FileInfo> files;
-    std::size_t total_bytes = 0;
-
-
-    // 收集文件信息
-    try {
-        for (const auto& entry : fs::directory_iterator(g_out_dir)) {
-            if (!entry.is_regular_file()) continue;
-            const auto& p = entry.path();
-            if (!is_image_file(p)) continue;
-
-            std::error_code ec1, ec2;
-            auto sz_raw = fs::file_size(p, ec1);   // uintmax_t
-            auto mt = fs::last_write_time(p, ec2);
-            if (ec1 || ec2) continue;
-
-            std::size_t sz = static_cast<std::size_t>(sz_raw);
-
-            files.push_back(FileInfo{p, mt, sz});
-            total_bytes += sz;
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[cleanup] scan failed: " << e.what() << "\n";
-        return;
-    }
-
-
-    if (files.empty()) return;
-
-    // -------- A. 按保留天数删除 --------
-    // 把 "现在-保留天数" 转成 filesystem 时钟近似阈值
-    auto now_sys = std::chrono::system_clock::now();
-    auto cutoff_sys = now_sys - std::chrono::hours(24 * g_retain_days);
-
-    // C++17下 file_time_type 与 system_clock 转换麻烦，采用“相对比较”法：
-    auto now_fs = fs::file_time_type::clock::now();
-    auto age_limit = std::chrono::hours(24 * g_retain_days);
-
-    int removed_by_age = 0;
-    for (const auto& f : files) {
-        auto age = now_fs - f.mtime;
-        if (age > age_limit) {
-            std::error_code ec;
-            if (fs::remove(f.path, ec) && !ec) {
-                total_bytes = (total_bytes > f.size) ? (total_bytes - f.size) : 0;
-                ++removed_by_age;
-                std::cout << "[cleanup] removed old: " << f.path.filename().string() << "\n";
-            }
-        }
-    }
-
-    // 重新收集一次（因为上面删过）
-    files.clear();
-    try {
-        for (const auto& entry : fs::directory_iterator(g_out_dir)) {
-            if (!entry.is_regular_file()) continue;
-            const auto& p = entry.path();
-            if (!is_image_file(p)) continue;
-
-            std::error_code ec1, ec2;
-            auto sz = fs::file_size(p, ec1);
-            auto mt = fs::last_write_time(p, ec2);
-            if (ec1 || ec2) continue;
-
-            files.push_back(FileInfo{p, mt, sz});
-        }
-    } catch (...) {
-        return;
-    }
-
-    // 按修改时间从旧到新排序
-    std::sort(files.begin(), files.end(),
-              [](const FileInfo& a, const FileInfo& b) { return a.mtime < b.mtime; });
-
-    // 重算总大小
-    total_bytes = 0;
-    for (const auto& f : files) total_bytes += f.size;
-
-    // -------- B. 按目录大小上限删除（从最老开始）--------
-    int removed_by_size = 0;
-    for (const auto& f : files) {
-        if (total_bytes <= g_max_dir_bytes) break;
-
-        std::error_code ec;
-        if (fs::remove(f.path, ec) && !ec) {
-            total_bytes = (total_bytes > f.size) ? (total_bytes - f.size) : 0;
-            ++removed_by_size;
-            std::cout << "[cleanup] removed for size: " << f.path.filename().string() << "\n";
-        }
-    }
-
-    if (removed_by_age > 0 || removed_by_size > 0) {
-        std::cout << "[cleanup] done. removed(age=" << removed_by_age
-                  << ", size=" << removed_by_size
-                  << "), remain_bytes=" << total_bytes << "\n";
-    }
-}
-
-
 void capture_poll() {
     if (!g_inited) return;
 
@@ -234,7 +104,7 @@ void capture_poll() {
     // 1) 采样lux平均
     double avg_lux = 0.0;
     int ok_count = 0;
-    bool lux_ok = read_lux_avg(g_lux_samples, g_sample_gap_ms, avg_lux, ok_count);
+    bool lux_ok = capture_read_lux_avg(g_lux_samples, g_sample_gap_ms, avg_lux, ok_count);
 
     bool need_fill = false;
     if (lux_ok) {
@@ -257,7 +127,32 @@ void capture_poll() {
         std::this_thread::sleep_for(std::chrono::milliseconds(g_light_warmup_ms));
     }
 
-    // 3) 拍5张并上传
+    // 3) 每轮拍照前采一次环境，5张共享同一份快照
+    const std::string round_id = make_round_id();
+    const std::string round_ts_utc = now_utc_iso();
+    EnvSnapshot env_snapshot{};
+    env_snapshot.valid = capture_read_env_data(env_snapshot);
+    capture_print_env_data(env_snapshot);
+    std::cout << "[round] id=" << round_id << "\n";
+
+    TelemetryPayload telemetry{};
+    const char* dev_id = std::getenv("DEVICE_ID");
+    telemetry.device_id = (dev_id && *dev_id) ? dev_id : "pi-001";
+    telemetry.ts_utc = round_ts_utc;
+    telemetry.has_light = lux_ok;
+    telemetry.light = avg_lux;
+    telemetry.has_temperature = env_snapshot.valid;
+    telemetry.temperature = env_snapshot.temperature_c;
+    telemetry.has_humidity = env_snapshot.valid;
+    telemetry.humidity = env_snapshot.humidity_pct;
+    // Local-only mode: disable telemetry upload to save Azure resources.
+    // (void)upload_telemetry(telemetry);
+    std::cout << "[telemetry] upload skipped (local test)\n";
+
+    const std::string round_csv = g_out_dir + "/round_env_log.csv";
+    capture_append_round_csv(round_csv, round_id, round_ts_utc, avg_lux, lux_ok,
+                             env_snapshot, need_fill, g_shots_per_round);
+
     int uploaded_count = 0;
 
     for (int i = 0; i < g_shots_per_round; ++i) {
@@ -276,14 +171,25 @@ void capture_poll() {
 
         std::cout << "[shot " << (i + 1) << "] saved: " << file << "\n";
 
-        std::string remote = std::filesystem::path(file).filename().string();
-        bool ok = upload_to_azure(file, remote);
-        if (ok) {
-            ++uploaded_count;
-            std::cout << "[shot " << (i + 1) << "] uploaded: " << remote << "\n";
-        } else {
-            std::cerr << "[shot " << (i + 1) << "] upload failed: " << remote << "\n";
-        }
+        UploadMetadata meta{};
+        meta.round_id = round_id;
+        meta.capture_id = round_id + "_shot_" + std::to_string(i + 1);
+        meta.captured_at_utc = now_utc_iso();
+        meta.lux_avg = avg_lux;
+        meta.env_valid = env_snapshot.valid;
+        meta.temperature_c = env_snapshot.temperature_c;
+        meta.pressure_hpa = env_snapshot.pressure_hpa;
+        meta.humidity_pct = env_snapshot.humidity_pct;
+
+        // Local-only mode: disable image inference upload to save Azure resources.
+        // bool ok = upload_to_predict(file, meta);
+        // if (ok) {
+        //     ++uploaded_count;
+        //     std::cout << "[shot " << (i + 1) << "] inferenced: " << file << "\n";
+        // } else {
+        //     std::cerr << "[shot " << (i + 1) << "] /predict failed: " << file << "\n";
+        // }
+        std::cout << "[shot " << (i + 1) << "] upload skipped (local test)\n";
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -297,7 +203,7 @@ void capture_poll() {
               << "/" << g_shots_per_round << " ===\n";
 
     // 清理本地缓存（按天数+容量）
-    cleanup_captures();
+    capture_cleanup_images(g_out_dir, g_retain_days, g_max_dir_bytes);
 
     // 5) 下次触发时间（避免漂移）
     g_next += std::chrono::seconds(g_interval);
@@ -309,7 +215,3 @@ void capture_poll() {
 void capture_deinit() {
     g_inited = false;
 }
-
-
-
-

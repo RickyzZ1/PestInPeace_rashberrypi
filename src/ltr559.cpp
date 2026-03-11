@@ -1,14 +1,21 @@
 #include "ltr559.hpp"
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
+#include <filesystem>
 #include <fcntl.h>
 #include <iostream>
 #include <linux/i2c-dev.h>
+#include <string>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <vector>
 
 // ===== I2C / LTR559 =====
-static const char* I2C_DEV = "/dev/i2c-1";
+static const char* DEFAULT_I2C_DEV = "/dev/i2c-1";
 static const uint8_t LTR559_ADDR = 0x23;
 
 // regs
@@ -24,15 +31,20 @@ static const uint8_t REG_PS_DATA_0     = 0x8D;
 static const uint8_t REG_PS_DATA_1     = 0x8E;
 
 static int g_fd = -1;
+static std::string g_i2c_dev;
 
-static bool write_reg(uint8_t reg, uint8_t val) {
+static bool write_reg_fd(int fd, uint8_t reg, uint8_t val) {
     uint8_t buf[2] = {reg, val};
-    return write(g_fd, buf, 2) == 2;
+    return write(fd, buf, 2) == 2;
 }
 
-static bool read_reg(uint8_t reg, uint8_t &val) {
-    if (write(g_fd, &reg, 1) != 1) return false;
-    return read(g_fd, &val, 1) == 1;
+static bool read_reg_fd(int fd, uint8_t reg, uint8_t& val) {
+    if (write(fd, &reg, 1) != 1) return false;
+    return read(fd, &val, 1) == 1;
+}
+
+static bool read_reg(uint8_t reg, uint8_t& val) {
+    return read_reg_fd(g_fd, reg, val);
 }
 
 // read 4 ALS bytes in one sequence: 0x88..0x8B
@@ -58,32 +70,70 @@ static bool read_ps_raw(uint16_t &ps) {
     return true;
 }
 
-bool ltr559_init() {
-    g_fd = open(I2C_DEV, O_RDWR);
-    if (g_fd < 0) {
-        perror("open i2c");
+static std::vector<std::string> collect_i2c_candidates() {
+    std::vector<std::string> out;
+    auto add_unique = [&](const std::string& dev) {
+        if (dev.empty()) return;
+        if (std::find(out.begin(), out.end(), dev) == out.end()) {
+            out.push_back(dev);
+        }
+    };
+
+    const char* env_dev = std::getenv("LTR559_I2C_DEV");
+    if (env_dev) add_unique(env_dev);
+    add_unique(DEFAULT_I2C_DEV);
+
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator("/dev")) {
+            const auto name = entry.path().filename().string();
+            if (name.rfind("i2c-", 0) == 0) {
+                add_unique(entry.path().string());
+            }
+        }
+    } catch (...) {
+        // Keep existing candidates only.
+    }
+    return out;
+}
+
+static bool try_init_on_bus(const std::string& dev) {
+    int fd = open(dev.c_str(), O_RDWR);
+    if (fd < 0) {
+        std::cerr << "open " << dev << " failed: " << std::strerror(errno) << "\n";
         return false;
     }
 
-    if (ioctl(g_fd, I2C_SLAVE, LTR559_ADDR) < 0) {
-        perror("ioctl I2C_SLAVE");
-        close(g_fd);
-        g_fd = -1;
+    if (ioctl(fd, I2C_SLAVE, LTR559_ADDR) < 0) {
+        std::cerr << "ioctl I2C_SLAVE on " << dev << " failed: " << std::strerror(errno) << "\n";
+        close(fd);
         return false;
     }
 
     uint8_t part = 0;
-    if (read_reg(REG_PART_ID, part)) {
-        std::cout << "PART_ID=0x" << std::hex << (int)part << std::dec << "\n";
+    if (read_reg_fd(fd, REG_PART_ID, part)) {
+        std::cout << "[ltr559] bus=" << dev
+                  << ", PART_ID=0x" << std::hex << (int)part << std::dec << "\n";
     } else {
-        std::cerr << "Read PART_ID failed\n";
+        std::cerr << "[ltr559] bus=" << dev << ", read PART_ID failed\n";
     }
 
-    if (!write_reg(REG_ALS_CONTR, 0x01)) return false;      // ALS enable
-    if (!write_reg(REG_ALS_MEAS_RATE, 0x03)) return false;  // 测量速率
-    if (!write_reg(REG_PS_CONTR, 0x03)) return false;       // PS enable
+    if (!write_reg_fd(fd, REG_ALS_CONTR, 0x01)) {
+        close(fd);
+        return false;
+    }
+    if (!write_reg_fd(fd, REG_ALS_MEAS_RATE, 0x03)) {
+        close(fd);
+        return false;
+    }
+    if (!write_reg_fd(fd, REG_PS_CONTR, 0x03)) {
+        close(fd);
+        return false;
+    }
 
     usleep(100000); // 100ms稳定时间
+    g_fd = fd;
+    g_i2c_dev = dev;
+    std::cout << "[ltr559] initialized on " << g_i2c_dev << "\n";
     return true;
 }
 
@@ -92,6 +142,20 @@ void ltr559_deinit() {
         close(g_fd);
         g_fd = -1;
     }
+    g_i2c_dev.clear();
+}
+
+bool ltr559_init() {
+    ltr559_deinit();
+    const auto candidates = collect_i2c_candidates();
+    for (const auto& dev : candidates) {
+        if (try_init_on_bus(dev)) {
+            return true;
+        }
+    }
+
+    std::cerr << "[ltr559] init failed on all I2C buses.\n";
+    return false;
 }
 
 bool ltr559_read_raw(uint16_t& ch0, uint16_t& ch1, uint16_t& ps, uint8_t& status) {

@@ -1,4 +1,5 @@
 #include "ltr559.hpp"
+#include "bme280.hpp"
 #include "light.hpp"
 #include "camera.hpp"
 
@@ -19,13 +20,18 @@ int main() {
         return 1;
     }
 
+    if (!bme280_init()) {
+        std::cerr << "bme280_init failed (continue without env sensor)\n";
+    }
+
     if (!light_init(4, 26)) {
         std::cerr << "light_init failed (GPIO may be busy)\n";
+        bme280_deinit();
         ltr559_deinit();
         return 1;
     }
 
-    if (!capture_init("/home/fiveguys/projects/demo/captures",
+    if (!capture_init("/home/fiveguys/project/PestInPeace_rashberrypi-main/captures",
                       20,    // 测试用20秒；正式部署建议7200（2小时）
                       2304, 1296,
                       5,      // 每轮5张
@@ -37,6 +43,7 @@ int main() {
                       2ull * 1024ull * 1024ull * 1024ull)) { // 最大2GB
         std::cerr << "capture_init failed\n";
         light_deinit();
+        bme280_deinit();
         ltr559_deinit();
         return 1;
     }
@@ -49,6 +56,7 @@ int main() {
     light_set_fill(false);
     capture_deinit();
     light_deinit();
+    bme280_deinit();
     ltr559_deinit();
 
     std::cout << "Stopped.\n";
@@ -58,4 +66,3 @@ int main() {
 
 //make clean && make
 //sudo ./iot_app
-
