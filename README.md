@@ -12,6 +12,7 @@ A comprehensive pest detection and monitoring system built for Raspberry Pi, com
 - [Installation](#installation)
 - [Building](#building)
 - [Usage](#usage)
+- [Update GitHub](#update-github)
 - [Project Components](#project-components)
 - [Contributing](#contributing)
 - [License](#license)
@@ -98,6 +99,11 @@ make clean
 ./iot_app
 ```
 
+If your device permissions require elevated access:
+```bash
+sudo ./iot_app
+```
+
 ### LTR559 Sensor Integration
 ```bash
 ./ltr559_iot
@@ -106,6 +112,33 @@ make clean
 ### Periodic Capture Utility
 ```bash
 ./periodic_capture
+```
+
+## 🔄 Update GitHub
+
+After changing code locally, use this standard workflow:
+
+```bash
+cd /home/fiveguys/project/PestInPeace_rashberrypi-main
+git status
+git add -A
+git commit -m "describe what changed"
+git push origin main
+```
+
+Command meaning:
+
+- `git status`: Check changed files before commit
+- `git add -A`: Stage all changes (new/modified/deleted)
+- `git commit -m "..."`: Create a local snapshot with a message
+- `git push origin main`: Upload commits to GitHub `main` branch
+
+If you only want to commit specific files:
+
+```bash
+git add src/main.cpp src/bme280.cpp
+git commit -m "update sensor logic"
+git push origin main
 ```
 
 ## 🔌 Project Components
