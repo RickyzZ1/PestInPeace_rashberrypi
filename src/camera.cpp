@@ -5,6 +5,7 @@
 #include "capture_env.hpp"
 #include "capture_lux.hpp"
 #include "capture_round_log.hpp"
+#include "soil.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -133,6 +134,18 @@ void capture_poll() {
     EnvSnapshot env_snapshot{};
     env_snapshot.valid = capture_read_env_data(env_snapshot);
     capture_print_env_data(env_snapshot);
+
+    SoilSnapshot soil_snapshot{};
+    soil_snapshot.valid = soil_read_snapshot(soil_snapshot);
+    if (soil_snapshot.valid) {
+        std::cout << std::fixed << std::setprecision(2)
+                  << "[SOIL] raw=" << soil_snapshot.raw
+                  << ", moisture=" << soil_snapshot.moisture_pct << " %\n"
+                  << std::defaultfloat;
+    } else {
+        std::cerr << "[soil] read failed\n";
+    }
+
     std::cout << "[round] id=" << round_id << "\n";
 
     TelemetryPayload telemetry{};
@@ -151,7 +164,7 @@ void capture_poll() {
 
     const std::string round_csv = g_out_dir + "/round_env_log.csv";
     capture_append_round_csv(round_csv, round_id, round_ts_utc, avg_lux, lux_ok,
-                             env_snapshot, need_fill, g_shots_per_round);
+                             env_snapshot, soil_snapshot, need_fill, g_shots_per_round);
 
     int uploaded_count = 0;
 

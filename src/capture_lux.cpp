@@ -26,6 +26,7 @@ bool capture_read_lux_avg(int sample_count, int gap_ms, double& avg_lux, int& ok
     std::vector<double> vals;
     vals.reserve(sample_count);
 
+    // Collect multiple samples and average them to reduce single-read noise.
     for (int i = 0; i < sample_count; ++i) {
         double lux = 0.0;
         if (read_lux_once(lux)) {
@@ -37,6 +38,7 @@ bool capture_read_lux_avg(int sample_count, int gap_ms, double& avg_lux, int& ok
     }
 
     ok_count = static_cast<int>(vals.size());
+    // Return false only when all reads failed.
     if (vals.empty()) return false;
 
     const double sum = std::accumulate(vals.begin(), vals.end(), 0.0);

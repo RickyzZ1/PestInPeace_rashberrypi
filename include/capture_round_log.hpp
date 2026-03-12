@@ -1,6 +1,7 @@
 #pragma once
 
 #include "capture_env.hpp"
+#include "soil.hpp"
 
 #include <string>
 
@@ -10,5 +11,6 @@ void capture_append_round_csv(const std::string& csv_path,
                               double lux_avg,
                               bool lux_valid,
                               const EnvSnapshot& env,
+                              const SoilSnapshot& soil,
                               bool fill_on,
                               int shots_planned);

@@ -1,5 +1,6 @@
 #include "ltr559.hpp"
 #include "bme280.hpp"
+#include "soil.hpp"
 #include "light.hpp"
 #include "camera.hpp"
 
@@ -24,8 +25,13 @@ int main() {
         std::cerr << "bme280_init failed (continue without env sensor)\n";
     }
 
-    if (!light_init(4, 26)) {
+    if (!soil_init(0)) {
+        std::cerr << "soil_init failed (continue without soil sensor)\n";
+    }
+
+    if (!light_init(4, 18)) {
         std::cerr << "light_init failed (GPIO may be busy)\n";
+        soil_deinit();
         bme280_deinit();
         ltr559_deinit();
         return 1;
@@ -43,6 +49,7 @@ int main() {
                       2ull * 1024ull * 1024ull * 1024ull)) { // 最大2GB
         std::cerr << "capture_init failed\n";
         light_deinit();
+        soil_deinit();
         bme280_deinit();
         ltr559_deinit();
         return 1;
@@ -56,6 +63,7 @@ int main() {
     light_set_fill(false);
     capture_deinit();
     light_deinit();
+    soil_deinit();
     bme280_deinit();
     ltr559_deinit();
 
