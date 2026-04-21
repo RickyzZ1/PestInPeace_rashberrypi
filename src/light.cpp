@@ -4,6 +4,7 @@
 #include <gpiod.h>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 
 static gpiod_chip* g_chip = nullptr;
 static gpiod_line_request* g_led_req = nullptr;
@@ -55,10 +56,17 @@ static void set_strip_ws2812(bool on) {
     std::string cmd = std::string("cd ") + app_root +
                       " && .venv/bin/python3 scripts/ws2812_set.py --pin " +
                       std::to_string(g_strip) + (on ? " --on" : " --off");
+    if (geteuid() != 0) {
+        // rpi_ws281x needs /dev/mem access; non-root runs should use passwordless sudo.
+        cmd = std::string("sudo -n /bin/bash -lc '") + cmd + "'";
+    }
     // Delegate WS2812 timing-sensitive protocol to Python rpi_ws281x helper.
     const int rc = std::system(cmd.c_str());
     if (rc != 0) {
         std::cerr << "[light] ws2812 command failed, rc=" << rc << "\n";
+        if (geteuid() != 0) {
+            std::cerr << "[light] hint: this is usually sudo permission (/dev/mem), not wiring.\n";
+        }
         return;
     }
     g_strip_state_on = on;

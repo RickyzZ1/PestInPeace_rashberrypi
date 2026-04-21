@@ -7,6 +7,10 @@
 #include <iostream>
 #include <string>
 
+// Soil module responsibilities:
+// 1) pick MCP3008 channel and calibration points
+// 2) read raw ADC from MCP3008
+// 3) convert raw value into moisture percentage for logging/decision use
 namespace {
 
 int g_channel = 0;
@@ -34,6 +38,7 @@ double raw_to_pct(int raw, int adc_dry, int adc_wet) {
 }  // namespace
 
 bool soil_init(int channel) {
+    // Call-site can pass a channel, but env var can override at runtime.
     g_channel = std::clamp(channel, 0, 7);
 
     g_channel = std::clamp(env_int_or("SOIL_ADC_CHANNEL", g_channel), 0, 7);
@@ -41,6 +46,7 @@ bool soil_init(int channel) {
     g_adc_dry = env_int_or("SOIL_ADC_DRY", g_adc_dry);
     g_adc_wet = env_int_or("SOIL_ADC_WET", g_adc_wet);
 
+    // SPI endpoint defaults to CE0; make it configurable for wiring variants.
     const std::string spi_dev = std::getenv("MCP3008_SPI_DEV") ? std::getenv("MCP3008_SPI_DEV") : "/dev/spidev0.0";
     const int spi_speed = env_int_or("MCP3008_SPI_SPEED", 1350000);
 
@@ -71,6 +77,7 @@ bool soil_read_snapshot(SoilSnapshot& out) {
         return false;
     }
 
+    // Snapshot is considered valid only if MCP3008 read succeeds.
     out.valid = true;
     out.raw = raw;
     out.moisture_pct = raw_to_pct(raw, g_adc_dry, g_adc_wet);

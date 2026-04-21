@@ -14,11 +14,16 @@
 #include <unistd.h>
 #include <vector>
 
+// LTR559 driver notes:
+// - auto-discovers I2C bus (env override + fallback scan)
+// - configures ALS + proximity engine once at init
+// - exposes raw values and a lightweight lux estimation helper
+
 // ===== I2C / LTR559 =====
 static const char* DEFAULT_I2C_DEV = "/dev/i2c-1";
 static const uint8_t LTR559_ADDR = 0x23;
 
-// regs
+// LTR559 register map used by this driver.
 static const uint8_t REG_ALS_CONTR     = 0x80;
 static const uint8_t REG_PS_CONTR      = 0x81;
 static const uint8_t REG_ALS_MEAS_RATE = 0x85;
@@ -39,6 +44,7 @@ static bool write_reg_fd(int fd, uint8_t reg, uint8_t val) {
 }
 
 static bool read_reg_fd(int fd, uint8_t reg, uint8_t& val) {
+    // Linux i2c-dev common pattern: write register address, then read payload.
     if (write(fd, &reg, 1) != 1) return false;
     return read(fd, &val, 1) == 1;
 }
@@ -47,7 +53,7 @@ static bool read_reg(uint8_t reg, uint8_t& val) {
     return read_reg_fd(g_fd, reg, val);
 }
 
-// read 4 ALS bytes in one sequence: 0x88..0x8B
+// Read ALS channel window in one burst: 0x88..0x8B.
 static bool read_als_raw(uint16_t &ch0, uint16_t &ch1) {
     uint8_t reg = REG_ALS_CH1_0;
     if (write(g_fd, &reg, 1) != 1) return false;
@@ -55,7 +61,7 @@ static bool read_als_raw(uint16_t &ch0, uint16_t &ch1) {
     uint8_t data[4];
     if (read(g_fd, data, 4) != 4) return false;
 
-    // CH1 first then CH0
+    // Device returns CH1 first (low/high), then CH0 (low/high), little-endian pairs.
     ch1 = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
     ch0 = (uint16_t)data[2] | ((uint16_t)data[3] << 8);
     return true;
@@ -66,6 +72,7 @@ static bool read_ps_raw(uint16_t &ps) {
     if (!read_reg(REG_PS_DATA_0, lo)) return false;
     if (!read_reg(REG_PS_DATA_1, hi)) return false;
     ps = ((uint16_t)hi << 8) | lo;
+    // Proximity ADC is 11-bit effective data (bits [10:0]).
     ps &= 0x07FF;
     return true;
 }
@@ -117,14 +124,17 @@ static bool try_init_on_bus(const std::string& dev) {
         std::cerr << "[ltr559] bus=" << dev << ", read PART_ID failed\n";
     }
 
+    // ALS_CONTR=0x01: ALS active, default gain settings.
     if (!write_reg_fd(fd, REG_ALS_CONTR, 0x01)) {
         close(fd);
         return false;
     }
+    // ALS_MEAS_RATE=0x03: integration/measurement timing selection.
     if (!write_reg_fd(fd, REG_ALS_MEAS_RATE, 0x03)) {
         close(fd);
         return false;
     }
+    // PS_CONTR=0x03: proximity active with default pulse/current profile.
     if (!write_reg_fd(fd, REG_PS_CONTR, 0x03)) {
         close(fd);
         return false;
@@ -161,9 +171,17 @@ bool ltr559_init() {
 bool ltr559_read_raw(uint16_t& ch0, uint16_t& ch1, uint16_t& ps, uint8_t& status) {
     if (g_fd < 0) return false;
 
-    if (!read_reg(REG_ALS_PS_STATUS, status)) return false;
+    // Status is helpful for diagnostics, but lux calculation only depends on ALS channels.
+    // Keep sampling alive even if status register has a transient read failure.
+    if (!read_reg(REG_ALS_PS_STATUS, status)) {
+        status = 0;
+    }
     if (!read_als_raw(ch0, ch1)) return false;
-    if (!read_ps_raw(ps)) return false;
+
+    // PS data is optional for current pipeline; do not fail lux path on PS read issues.
+    if (!read_ps_raw(ps)) {
+        ps = 0;
+    }
 
     return true;
 }

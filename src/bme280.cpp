@@ -14,6 +14,10 @@
 #include <unistd.h>
 #include <vector>
 
+// BME280 driver notes:
+// - auto-discovers bus/address (env override first, then common defaults)
+// - reads and stores factory calibration coefficients once at init
+// - uses Bosch integer compensation formulas for T/P/H conversion
 namespace {
 
 static constexpr uint8_t DEFAULT_ADDR1 = 0x76;
@@ -57,6 +61,7 @@ static CalibData g_calib;
 static int32_t g_t_fine = 0;
 
 static bool read_bytes_fd(int fd, uint8_t start_reg, uint8_t* buf, std::size_t len) {
+    // I2C repeated-read pattern: set start register pointer, then burst-read bytes.
     if (write(fd, &start_reg, 1) != 1) return false;
     return read(fd, buf, len) == static_cast<ssize_t>(len);
 }
@@ -119,6 +124,8 @@ static std::vector<uint8_t> collect_addr_candidates() {
 }
 
 static bool read_calibration(int fd, CalibData& c) {
+    // Datasheet layout:
+    // 0x88..0xA1 holds temp/pressure and H1, 0xE1..0xE7 holds remaining humidity coeffs.
     uint8_t b1[26] = {};
     uint8_t b2[7] = {};
     if (!read_bytes_fd(fd, 0x88, b1, sizeof(b1))) return false;
@@ -140,6 +147,9 @@ static bool read_calibration(int fd, CalibData& c) {
 
     c.H2 = s16_le(&b2[0]);
     c.H3 = b2[2];
+    // H4/H5 are packed across E4/E5/E6:
+    // H4 uses E4 as msb and E5[3:0] as lsb nibble.
+    // H5 uses E6 as msb and E5[7:4] as lsb nibble.
     c.H4 = static_cast<int16_t>((static_cast<int16_t>(b2[3]) << 4) | (b2[4] & 0x0F));
     c.H5 = static_cast<int16_t>((static_cast<int16_t>(b2[5]) << 4) | (b2[4] >> 4));
     c.H6 = static_cast<int8_t>(b2[6]);
@@ -171,6 +181,7 @@ static bool try_init_one(const std::string& dev, uint8_t addr) {
         return false;
     }
 
+    // Soft reset command from datasheet.
     if (!write_reg_fd(fd, REG_RESET, 0xB6)) {
         close(fd);
         return false;
@@ -183,10 +194,12 @@ static bool try_init_one(const std::string& dev, uint8_t addr) {
             close(fd);
             return false;
         }
+        // STATUS[0]=1 while NVM calibration copy is running after reset.
         if ((st & 0x01) == 0) break;
         usleep(2000);
     }
 
+    // Write humidity oversampling first. CTRL_MEAS write latches CTRL_HUM.
     if (!write_reg_fd(fd, REG_CTRL_HUM, 0x01)) {  // x1 humidity oversampling
         close(fd);
         return false;
@@ -242,17 +255,21 @@ bool bme280_read_env(double& temperature_c, double& humidity_percent, double& pr
     uint8_t data[8] = {};
     if (!read_bytes_fd(g_fd, REG_PRESS_MSB, data, sizeof(data))) return false;
 
+    // Pressure and temperature are 20-bit unsigned raw values (msb, lsb, xlsb[7:4]).
     const int32_t adc_p = (static_cast<int32_t>(data[0]) << 12) |
                           (static_cast<int32_t>(data[1]) << 4) |
                           (static_cast<int32_t>(data[2]) >> 4);
     const int32_t adc_t = (static_cast<int32_t>(data[3]) << 12) |
                           (static_cast<int32_t>(data[4]) << 4) |
                           (static_cast<int32_t>(data[5]) >> 4);
+    // Humidity is 16-bit unsigned (msb, lsb).
     const int32_t adc_h = (static_cast<int32_t>(data[6]) << 8) |
                           static_cast<int32_t>(data[7]);
 
+    // Guard invalid raw sentinels.
     if (adc_t == 0x80000 || adc_p == 0x80000 || adc_h == 0x8000) return false;
 
+    // Datasheet compensation formula (integer path) for temperature.
     int32_t var1 = ((((adc_t >> 3) - (static_cast<int32_t>(g_calib.T1) << 1))) *
                     static_cast<int32_t>(g_calib.T2)) >> 11;
     int32_t var2 = (((((adc_t >> 4) - static_cast<int32_t>(g_calib.T1)) *
@@ -263,6 +280,7 @@ bool bme280_read_env(double& temperature_c, double& humidity_percent, double& pr
     const int32_t t = (g_t_fine * 5 + 128) >> 8;
     temperature_c = static_cast<double>(t) / 100.0;
 
+    // Datasheet compensation formula (64-bit integer path) for pressure.
     int64_t v1 = static_cast<int64_t>(g_t_fine) - 128000;
     int64_t v2 = v1 * v1 * static_cast<int64_t>(g_calib.P6);
     v2 += (v1 * static_cast<int64_t>(g_calib.P5)) << 17;
@@ -280,6 +298,7 @@ bool bme280_read_env(double& temperature_c, double& humidity_percent, double& pr
     const double pressure_pa = static_cast<double>(p) / 256.0;
     pressure_hpa = pressure_pa / 100.0;
 
+    // Datasheet compensation formula for relative humidity.
     int32_t h = g_t_fine - 76800;
     h = (((((adc_h << 14) - (static_cast<int32_t>(g_calib.H4) << 20) -
              (static_cast<int32_t>(g_calib.H5) * h)) +

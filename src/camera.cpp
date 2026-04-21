@@ -6,8 +6,12 @@
 #include "capture_lux.hpp"
 #include "capture_round_log.hpp"
 #include "soil.hpp"
+#include "spray.hpp"
+#include "upload_queue.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -59,6 +63,42 @@ static std::string make_round_id() {
     return "round_" + std::to_string(now_ms);
 }
 
+static bool get_forced_pest_count(int& out_count) {
+    const char* raw = std::getenv("FORCE_PEST_COUNT");
+    if (!raw || !*raw) return false;
+
+    char* end = nullptr;
+    long v = std::strtol(raw, &end, 10);
+    if (!end || *end != '\0' || v < 0) return false;
+
+    out_count = static_cast<int>(v);
+    return true;
+}
+
+static bool cloud_upload_enabled() {
+    const char* raw = std::getenv("ENABLE_CLOUD_UPLOAD");
+    if (!raw || !*raw) return true; // default: cloud mode
+    return std::string(raw) != "0";
+}
+
+static int env_int_or(const char* key, int fallback) {
+    const char* raw = std::getenv(key);
+    if (!raw || !*raw) return fallback;
+    char* end = nullptr;
+    long v = std::strtol(raw, &end, 10);
+    if (!end || *end != '\0') return fallback;
+    return static_cast<int>(v);
+}
+
+static double env_double_or(const char* key, double fallback) {
+    const char* raw = std::getenv(key);
+    if (!raw || !*raw) return fallback;
+    char* end = nullptr;
+    double v = std::strtod(raw, &end);
+    if (!end || *end != '\0') return fallback;
+    return v;
+}
+
 bool capture_init(const std::string& out_dir,
                   int interval_sec,
                   int width,
@@ -91,6 +131,11 @@ bool capture_init(const std::string& out_dir,
 
     g_next = clk::now(); // immediate first round
     g_inited = true;
+    if (!upload_queue_init(g_out_dir + "/upload_queue.tsv")) {
+        std::cerr << "[camera] upload_queue_init failed\n";
+        g_inited = false;
+        return false;
+    }
     return true;
 }
 
@@ -99,6 +144,18 @@ void capture_poll() {
 
     const auto now = clk::now();
     if (now < g_next) return;
+    const bool cloud_on = cloud_upload_enabled();
+
+    // Cloud mode backpressure:
+    // Pause new capture rounds until upload queue is drained.
+    if (cloud_on) {
+        const std::size_t pending = upload_queue_pending_count();
+        if (pending > 0) {
+            std::cout << "[capture] pause, waiting upload queue drain, pending=" << pending << "\n";
+            g_next = clk::now() + std::chrono::seconds(5);
+            return;
+        }
+    }
 
     std::cout << "\n=== Capture round started ===\n";
 
@@ -158,15 +215,20 @@ void capture_poll() {
     telemetry.temperature = env_snapshot.temperature_c;
     telemetry.has_humidity = env_snapshot.valid;
     telemetry.humidity = env_snapshot.humidity_pct;
-    // Local-only mode: disable telemetry upload to save Azure resources.
-    // (void)upload_telemetry(telemetry);
-    std::cout << "[telemetry] upload skipped (local test)\n";
+    if (cloud_on) {
+        upload_queue_enqueue_telemetry(telemetry);
+        std::cout << "[telemetry] queued, pending=" << upload_queue_pending_count() << "\n";
+    } else {
+        std::cout << "[telemetry] upload skipped (local mode)\n";
+    }
 
     const std::string round_csv = g_out_dir + "/round_env_log.csv";
     capture_append_round_csv(round_csv, round_id, round_ts_utc, avg_lux, lux_ok,
                              env_snapshot, soil_snapshot, need_fill, g_shots_per_round);
 
-    int uploaded_count = 0;
+    int queued_count = 0;
+    int infer_count_sum = 0;
+    int infer_count_valid = 0;
 
     for (int i = 0; i < g_shots_per_round; ++i) {
         std::string file = g_out_dir + "/photo_" + now_ts() + "_" + std::to_string(i + 1) + ".jpg";
@@ -194,15 +256,24 @@ void capture_poll() {
         meta.pressure_hpa = env_snapshot.pressure_hpa;
         meta.humidity_pct = env_snapshot.humidity_pct;
 
-        // Local-only mode: disable image inference upload to save Azure resources.
-        // bool ok = upload_to_predict(file, meta);
-        // if (ok) {
-        //     ++uploaded_count;
-        //     std::cout << "[shot " << (i + 1) << "] inferenced: " << file << "\n";
-        // } else {
-        //     std::cerr << "[shot " << (i + 1) << "] /predict failed: " << file << "\n";
-        // }
-        std::cout << "[shot " << (i + 1) << "] upload skipped (local test)\n";
+        int shot_count = -1;
+        bool ok = false;
+        if (cloud_on) {
+            upload_queue_enqueue_predict(file, meta);
+            ok = true;
+            ++queued_count;
+            std::cout << "[shot " << (i + 1) << "] queued for /predict: " << file
+                      << ", pending=" << upload_queue_pending_count() << "\n";
+        } else {
+            std::cout << "[shot " << (i + 1) << "] /predict skipped (local mode): " << file << "\n";
+        }
+
+        if (ok && shot_count >= 0) {
+            infer_count_sum += shot_count;
+            ++infer_count_valid;
+            std::cout << "[shot " << (i + 1) << "] inferenced: " << file
+                      << ", count=" << shot_count << "\n";
+        }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
@@ -212,8 +283,64 @@ void capture_poll() {
         light_set_fill(false);
     }
 
-    std::cout << "=== Capture round done: uploaded " << uploaded_count
+    std::cout << "=== Capture round done: queued " << queued_count
               << "/" << g_shots_per_round << " ===\n";
+
+    int forced_pest_count = 0;
+    if (get_forced_pest_count(forced_pest_count)) {
+        infer_count_sum = forced_pest_count;
+        infer_count_valid = 1;
+        std::cout << "[pest] local override FORCE_PEST_COUNT=" << forced_pest_count << "\n";
+    }
+
+    if (cloud_on) {
+        int decision_aphid_count = env_int_or("DECISION_APHID_COUNT", 0);
+        if (infer_count_valid > 0) {
+            const double pest_pressure =
+                static_cast<double>(infer_count_sum) / static_cast<double>(infer_count_valid);
+            decision_aphid_count = static_cast<int>(std::lround(pest_pressure));
+        }
+        if (forced_pest_count > 0) {
+            decision_aphid_count = forced_pest_count;
+        }
+
+        WeeklyDecisionInput in{};
+        in.aphid_count = std::max(0, decision_aphid_count);
+        in.field_area_ha = env_double_or("DECISION_FIELD_AREA_HA", 1.0);
+        in.exposure_days = env_int_or("DECISION_EXPOSURE_DAYS", 7);
+        in.in_tepp_window = env_int_or("DECISION_IN_TEPP_WINDOW", -1);
+        in.apps_so_far = env_int_or("DECISION_APPS_SO_FAR", 0);
+        in.respect_compliance_gate = env_int_or("DECISION_RESPECT_GATE", 1) != 0;
+        in.t_mean = env_snapshot.valid ? env_snapshot.temperature_c : env_double_or("DECISION_T_MEAN", 15.0);
+        in.rh_mean = env_snapshot.valid ? env_snapshot.humidity_pct : env_double_or("DECISION_RH_MEAN", 70.0);
+
+        WeeklyDecisionResult decision{};
+        if (fetch_weekly_decision(in, decision)) {
+            std::cout << "[decision] raw: " << decision.raw_json << "\n";
+            (void)spray_apply_for_scope(decision.scope_class);
+        } else {
+            std::cerr << "[decision] fetch failed, fallback to local pressure logic\n";
+            if (infer_count_valid > 0) {
+                const double pest_pressure =
+                    static_cast<double>(infer_count_sum) / static_cast<double>(infer_count_valid);
+                std::cout << "[pest] avg_count=" << pest_pressure
+                          << " (" << infer_count_valid << " valid shots)\n";
+                (void)spray_apply_for_pressure(pest_pressure);
+            } else {
+                std::cout << "[pest] no valid infer counts, skip spraying\n";
+            }
+        }
+    } else {
+        if (infer_count_valid > 0) {
+            const double pest_pressure =
+                static_cast<double>(infer_count_sum) / static_cast<double>(infer_count_valid);
+            std::cout << "[pest] avg_count=" << pest_pressure
+                      << " (" << infer_count_valid << " valid shots)\n";
+            (void)spray_apply_for_pressure(pest_pressure);
+        } else {
+            std::cout << "[pest] no valid infer counts, skip spraying\n";
+        }
+    }
 
     // 清理本地缓存（按天数+容量）
     capture_cleanup_images(g_out_dir, g_retain_days, g_max_dir_bytes);
@@ -226,5 +353,6 @@ void capture_poll() {
 }
 
 void capture_deinit() {
+    upload_queue_deinit();
     g_inited = false;
 }

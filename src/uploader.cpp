@@ -74,6 +74,18 @@ std::string normalize_telemetry_url(const std::string& raw) {
     return u + "/telemetry";
 }
 
+std::string normalize_decision_url(const std::string& raw) {
+    std::string u = trim(raw);
+    while (!u.empty() && u.back() == '/') {
+        u.pop_back();
+    }
+
+    if (u.size() >= 16 && u.compare(u.size() - 16, 16, "/decision/weekly") == 0) {
+        return u;
+    }
+    return u + "/decision/weekly";
+}
+
 std::string append_query(const std::string& url, const std::string& key, const std::string& value) {
     if (value.empty()) return url;
     const char sep = (url.find('?') == std::string::npos) ? '?' : '&';
@@ -134,9 +146,10 @@ std::string extract_string_field(const std::string& json_body, const std::string
 
 } // namespace
 
-bool upload_to_predict(const std::string& local_file, const UploadMetadata& metadata) {
+bool upload_to_predict(const std::string& local_file, const UploadMetadata& metadata, int* out_count) {
+    if (out_count) *out_count = -1;
     std::string predict_url = normalize_predict_url(
-        get_env_or_default("PREDICT_URL", "https://aca-aphid-yolo.jollystone-e01fd827.swedencentral.azurecontainerapps.io/predict")
+        get_env_or_default("PREDICT_URL", "https://aca-aphid-yolo.salmonforest-9615860e.swedencentral.azurecontainerapps.io/predict")
     );
 
     predict_url = append_query(predict_url, "conf", get_env_or_default("PREDICT_CONF", "0.25"));
@@ -214,6 +227,7 @@ bool upload_to_predict(const std::string& local_file, const UploadMetadata& meta
     }
 
     const int count = extract_int_field(body, "count", -1);
+    if (out_count) *out_count = count;
     const std::string req_id = extract_string_field(body, "request_id");
     std::cout << "[uploader] /predict ok"
               << ", request_id=" << (req_id.empty() ? "n/a" : req_id)
@@ -231,7 +245,7 @@ bool upload_telemetry(const TelemetryPayload& payload) {
 
     std::string telemetry_url = normalize_telemetry_url(
         get_env_or_default("TELEMETRY_URL",
-                           "https://aca-aphid-yolo.jollystone-e01fd827.swedencentral.azurecontainerapps.io/telemetry")
+                           "https://aca-aphid-yolo.salmonforest-9615860e.swedencentral.azurecontainerapps.io/telemetry")
     );
     const std::string timeout = get_env_or_default("TELEMETRY_TIMEOUT", "15");
 
@@ -303,5 +317,99 @@ bool upload_telemetry(const TelemetryPayload& payload) {
     }
 
     std::cout << "[telemetry] ok, device_id=" << payload.device_id << "\n";
+    return true;
+}
+
+bool fetch_weekly_decision(const WeeklyDecisionInput& input, WeeklyDecisionResult& out) {
+    out = WeeklyDecisionResult{};
+
+    std::string decision_url = get_env_or_default("DECISION_URL", "");
+    if (decision_url.empty()) {
+        const std::string predict_url = get_env_or_default(
+            "PREDICT_URL",
+            "https://aca-aphid-yolo.salmonforest-9615860e.swedencentral.azurecontainerapps.io/predict"
+        );
+        std::string base = trim(predict_url);
+        const std::size_t p = base.find("/predict");
+        if (p != std::string::npos) {
+            base = base.substr(0, p);
+        }
+        decision_url = base;
+    }
+    decision_url = normalize_decision_url(decision_url);
+
+    const std::string timeout = get_env_or_default("DECISION_TIMEOUT", "20");
+
+    std::ostringstream json;
+    json << "{"
+         << "\"aphid_count\":" << std::max(0, input.aphid_count)
+         << ",\"field_area_ha\":" << fmt_double(input.field_area_ha)
+         << ",\"exposure_days\":" << std::max(1, input.exposure_days)
+         << ",\"t_mean\":" << fmt_double(input.t_mean)
+         << ",\"rh_mean\":" << fmt_double(input.rh_mean)
+         << ((input.in_tepp_window >= 0 && input.in_tepp_window <= 1)
+                 ? (std::string(",\"in_tepp_window\":") + std::to_string(input.in_tepp_window))
+                 : std::string())
+         << ",\"apps_so_far\":" << std::max(0, input.apps_so_far)
+         << ",\"respect_compliance_gate\":" << (input.respect_compliance_gate ? "true" : "false")
+         << "}";
+
+    std::string cmd =
+        "curl -sS --connect-timeout 8 --max-time " + timeout +
+        " -X POST" +
+        " -H 'Content-Type: application/json'" +
+        " --data " + shell_escape_single_quote(json.str()) +
+        " " + shell_escape_single_quote(decision_url) +
+        " -w '\\n%{http_code}'";
+
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        std::cerr << "[decision] popen failed.\n";
+        return false;
+    }
+
+    std::string output;
+    std::array<char, 1024> buffer{};
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+        output += buffer.data();
+    }
+
+    const int rc = pclose(pipe);
+    if (rc != 0) {
+        std::cerr << "[decision] curl process failed, rc=" << rc << "\n";
+        return false;
+    }
+
+    const std::size_t pos = output.rfind('\n');
+    if (pos == std::string::npos || pos + 1 >= output.size()) {
+        std::cerr << "[decision] unexpected response format.\n";
+        return false;
+    }
+
+    const std::string body = output.substr(0, pos);
+    const std::string status_str = output.substr(pos + 1);
+    int status_code = 0;
+    try {
+        status_code = std::stoi(status_str);
+    } catch (...) {
+        std::cerr << "[decision] invalid HTTP status: " << status_str << "\n";
+        return false;
+    }
+
+    if (status_code < 200 || status_code >= 300) {
+        std::cerr << "[decision] HTTP " << status_code << "\n";
+        if (!body.empty()) {
+            std::cerr << "[decision] body: " << body << "\n";
+        }
+        return false;
+    }
+
+    out.ok = true;
+    out.scope_class = extract_int_field(body, "scope_class", 0);
+    out.scope_name = extract_string_field(body, "scope_name");
+    out.raw_json = body;
+
+    std::cout << "[decision] ok, scope_class=" << out.scope_class
+              << ", scope_name=" << (out.scope_name.empty() ? "n/a" : out.scope_name) << "\n";
     return true;
 }

@@ -10,6 +10,10 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+// Thin MCP3008 SPI driver:
+// - owns one spidev file descriptor
+// - configures SPI mode/speed/word size once at init
+// - reads 10-bit ADC values per channel on demand
 namespace {
 
 int g_fd = -1;
@@ -21,6 +25,7 @@ std::string g_dev;
 }  // namespace
 
 bool mcp3008_init(const std::string& dev, uint32_t speed_hz) {
+    // Re-init is allowed; close old fd first.
     mcp3008_deinit();
 
     int fd = open(dev.c_str(), O_RDWR);
@@ -33,6 +38,7 @@ bool mcp3008_init(const std::string& dev, uint32_t speed_hz) {
     uint8_t bits = 8;
     uint32_t speed = speed_hz;
 
+    // Configure then read back SPI parameters to confirm kernel-accepted values.
     if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0 ||
         ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 ||
         ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0 ||
@@ -66,12 +72,20 @@ void mcp3008_deinit() {
 }
 
 bool mcp3008_read_channel(int channel, int& value) {
+    // Input:
+    //   channel: 0..7 (single-ended channel index)
+    // Output:
+    //   value: 10-bit ADC value (0..1023) when return=true
+    // Failure cases:
+    //   device not initialized, invalid channel, SPI ioctl error
     value = 0;
     if (g_fd < 0) return false;
     if (channel < 0 || channel > 7) return false;
 
-    // MCP3008 single-ended read frame:
-    // byte0=start(1), byte1=single(1)+channel(3), byte2=dummy.
+    // MCP3008 single-ended frame (3 bytes):
+    // tx[0] = 00000001: start bit.
+    // tx[1] = 1 D2 D1 D0 0000: single-ended flag + 3-bit channel index. See Datasheet for D2 D1 D0 for channel selection
+    // tx[2] = 00000000: clock out remaining result bits.
     uint8_t tx[3] = {
         0x01,
         static_cast<uint8_t>(0x80 | ((channel & 0x07) << 4)),
@@ -80,6 +94,7 @@ bool mcp3008_read_channel(int channel, int& value) {
     uint8_t rx[3] = {0, 0, 0};
 
     spi_ioc_transfer tr{};
+    // Single transfer is enough: send command and receive result in one ioctl.
     tr.tx_buf = reinterpret_cast<unsigned long>(tx);
     tr.rx_buf = reinterpret_cast<unsigned long>(rx);
     tr.len = 3;
@@ -91,7 +106,8 @@ bool mcp3008_read_channel(int channel, int& value) {
         return false;
     }
 
-    // 10-bit ADC result is spread across rx[1:2].
+    // Result format:
+    // rx[1] low 2 bits are ADC[9:8], rx[2] is ADC[7:0].
     value = ((rx[1] & 0x03) << 8) | rx[2];
     return true;
 }

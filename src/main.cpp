@@ -2,6 +2,7 @@
 #include "bme280.hpp"
 #include "soil.hpp"
 #include "light.hpp"
+#include "spray.hpp"
 #include "camera.hpp"
 
 #include <chrono>
@@ -29,8 +30,13 @@ int main() {
         std::cerr << "soil_init failed (continue without soil sensor)\n";
     }
 
+    if (!spray_init(26, 20, 21)) {
+        std::cerr << "spray_init failed (continue without spraying)\n";
+    }
+
     if (!light_init(4, 18)) {
         std::cerr << "light_init failed (GPIO may be busy)\n";
+        spray_deinit();
         soil_deinit();
         bme280_deinit();
         ltr559_deinit();
@@ -38,7 +44,7 @@ int main() {
     }
 
     if (!capture_init("/home/fiveguys/project/PestInPeace_rashberrypi-main/captures",
-                      20,    // 测试用20秒；正式部署建议7200（2小时）
+                      21600,    // 测试用20秒；正式部署建议7200（2小时）
                       2304, 1296,
                       5,      // 每轮5张
                       5,      // lux采样5次
@@ -49,6 +55,7 @@ int main() {
                       2ull * 1024ull * 1024ull * 1024ull)) { // 最大2GB
         std::cerr << "capture_init failed\n";
         light_deinit();
+        spray_deinit();
         soil_deinit();
         bme280_deinit();
         ltr559_deinit();
@@ -63,6 +70,7 @@ int main() {
     light_set_fill(false);
     capture_deinit();
     light_deinit();
+    spray_deinit();
     soil_deinit();
     bme280_deinit();
     ltr559_deinit();
